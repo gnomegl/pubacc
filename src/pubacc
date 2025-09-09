@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+
+# @describe Public Accountability API client for searching public records
+# @arg command "Command to run (search, datasets, entity)" [string]
+# @arg query "Search query term" [string]
+# @option -a --amount "Amount filter for contributions" [string]
+# @option -c --collection "Collection ID to filter by (0=Any Collection)" [int] @default "0"
+# @option -n --collection-name "Collection name filter" [string] @default "Any Collection"
+# @option -p --page "Page number for results pagination" [int] @default "1"
+# @option -s --size "Page size for results" [int] @default "500"
+# @option -t --state "Filter by state abbreviation" [string]
+# @option -d --dataset "Filter by specific dataset ID" [int]
+# @option -e --entity-id "Entity ID for detailed lookup" [string]
+# @flag   -j --json "Output raw JSON instead of formatted results"
+# @flag   -q --quiet "Suppress colored output"
+# @flag   -v --verbose "Show additional details"
+# @meta require-tools curl,jq
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+declare argc_quiet=0
+declare argc_verbose=0
+declare argc_page=1
+declare argc_collection=0
+declare argc_json=0
+
+setup_colors() {
+  if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+  fi
+}
+setup_colors
+
+API_BASE="https://publicaccountability.org"
+
+print_kv() {
+  printf "${bold}%s:${reset} %s\n" "$1" "$2"
+}
+
+print_section() {
+  printf "\n${bold}%s:${reset}\n" "$1"
+}
+
+url_encode() {
+  local string="${1}"
+  local strlen=${#string}
+  local encoded=""
+  local pos c o
+
+  for (( pos=0 ; pos<strlen ; pos++ )); do
+     c=${string:$pos:1}
+     case "$c" in
+        [-_.~a-zA-Z0-9] ) o="${c}" ;;
+        * )               printf -v o '%%%02x' "'$c"
+     esac
+     encoded+="${o}"
+  done
+  echo "${encoded}"
+}
+
+make_request() {
+  local endpoint="$1"
+  local params="$2"
+  local url="${API_BASE}/${endpoint}?${params}"
+  local response
+  response=$(curl -s "$url")
+
+  if [ -z "$response" ] || [ "$response" = "null" ]; then
+    printf "${red}Error:${reset} No response from API\n" >&2
+    exit 1
+  fi
+
+  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+    error_msg=$(echo "$response" | jq -r '.error')
+    printf "${red}Error:${reset} %s\n" "$error_msg" >&2
+    exit 1
+  fi
+
+  echo "$response"
+}
+
+show_help() {
+  echo "${bold}Public Accountability API Client${reset}"
+  echo ""
+  echo "${bold}Commands:${reset}"
+  echo "  ${cyan}search${reset}        Search public records by name/term"
+  echo "  ${cyan}entity${reset}        Get detailed information about a specific entity"
+  echo "  ${cyan}datasets${reset}      List available datasets (placeholder command)"
+  echo ""
+  echo "${bold}Examples:${reset}"
+  echo "  ${green}$(basename "$0") search \"John Smith\"${reset}"
+  echo "  ${green}$(basename "$0") search \"Acme Corp\" --state CA --page 2${reset}"
+  echo "  ${green}$(basename "$0") search \"political donation\" --collection 1 --amount 1000${reset}"
+  echo "  ${green}$(basename "$0") entity --entity-id 247945${reset}"
+  echo ""
+  echo "${bold}Options:${reset}"
+  echo "  ${yellow}-a, --amount${reset}         Amount filter for contributions"
+  echo "  ${yellow}-c, --collection${reset}     Collection ID (0=Any Collection)"
+  echo "  ${yellow}-n, --collection-name${reset} Collection name"
+  echo "  ${yellow}-p, --page${reset}           Page number"
+  echo "  ${yellow}-s, --size${reset}           Results per page"
+  echo "  ${yellow}-t, --state${reset}          Filter by state (e.g., CA, NY)"
+  echo "  ${yellow}-d, --dataset${reset}        Filter by dataset ID"
+  echo "  ${yellow}-e, --entity-id${reset}      Entity ID for lookup"
+  echo "  ${yellow}-j, --json${reset}           Output raw JSON"
+  echo "  ${yellow}-q, --quiet${reset}          Suppress colored output"
+  echo "  ${yellow}-v, --verbose${reset}        Show additional details"
+}
+
+format_search_results() {
+  local response="$1"
+  local total_count
+  local page_shown
+  local page_size
+  local results_count
+  total_count=$(echo "$response" | jq -r '.total_count')
+  page_shown=$(echo "$response" | jq -r '.page_shown')
+  page_size=$(echo "$response" | jq -r '.page_size')
+  results_count=$(echo "$response" | jq -r '.results | length')
+
+  local collection_counts
+  local state_counts
+  collection_counts=$(echo "$response" | jq -r '.filter_counts.collection // empty | to_entries[] | "\(.key):\(.value)"' 2>/dev/null)
+  state_counts=$(echo "$response" | jq -r '.filter_counts.state // empty | to_entries[] | "\(.key):\(.value)"' 2>/dev/null)
+
+  if [ -n "$collection_counts" ] || [ -n "$state_counts" ]; then
+    print_section "Filters Available"
+    if [ -n "$state_counts" ]; then
+      printf "  ${cyan}By State:${reset} "
+      echo "$state_counts" | while read -r state_count; do
+        printf "${magenta}%s${reset}, " "$state_count"
+      done
+      printf "\b\b \n"
+    fi
+    if [ -n "$collection_counts" ]; then
+      printf "  ${cyan}By Collection:${reset} "
+      echo "$collection_counts" | while read -r coll_count; do
+        printf "${magenta}%s${reset}, " "$coll_count"
+      done
+      printf "\b\b \n"
+    fi
+    echo ""
+  fi
+
+  echo "$response" | jq -r '.results[] | "\(.EntityID)|\(.Name)|\(.Address)|\(.State)|\(.ZIP5)|\(.MinYear)|\(.MaxYear)|\(.dataset)|\(.Count)|\(.url)"' |
+    while IFS="|" read -r entity_id name address state zip min_year max_year dataset count url; do
+      printf "${bold}* ${green}%s${reset} (ID: ${yellow}%s${reset})\n" "$name" "$entity_id"
+      printf "  ${cyan}Address:${reset} ${magenta}%s${reset}" "$address"
+      [ "$state" != "" ] && printf " ${blue}%s${reset}" "$state"
+      [ "$zip" != "" ] && printf " ${blue}%s${reset}" "$zip"
+      printf "\n"
+
+      printf "  ${cyan}Dataset:${reset} ${yellow}%s${reset}" "$dataset"
+      [ "$count" != "" ] && [ "$count" != "null" ] && printf " (${green}%s${reset} records)" "$count"
+      printf "\n"
+
+      if [ "$min_year" != "" ] && [ "$min_year" != "null" ] && [ "$max_year" != "" ] && [ "$max_year" != "null" ]; then
+        if [ "$min_year" = "$max_year" ]; then
+          printf "  ${cyan}Year:${reset} ${blue}%s${reset}\n" "$min_year"
+        else
+          printf "  ${cyan}Years:${reset} ${blue}%s${reset} - ${blue}%s${reset}\n" "$min_year" "$max_year"
+        fi
+      fi
+
+      if [ "$argc_verbose" = 1 ]; then
+        printf "  ${cyan}URL:${reset} ${blue}%s%s${reset}\n" "$API_BASE" "$url"
+      fi
+
+      printf "\n"
+    done
+
+  # Show pagination info
+  if [ "$total_count" -gt "$page_size" ]; then
+    local total_pages=$(( (total_count + page_size - 1) / page_size ))
+    printf "${bold}Pagination:${reset} Page ${yellow}%s${reset} of ${yellow}%s${reset}\n" "$page_shown" "$total_pages"
+    if [ "$page_shown" -lt "$total_pages" ]; then
+      printf "${cyan}Next page:${reset} $(basename "$0") search \"$argc_query\" --page %s\n" "$((page_shown + 1))"
+    fi
+  fi
+}
+
+format_entity_details() {
+  local response="$1"
+  # This would need to be implemented based on the actual entity detail API response
+  # Since we don't have an example of this endpoint, we'll show a placeholder
+  printf "${yellow}Note:${reset} Entity detail formatting not yet implemented.\n"
+  printf "${cyan}Use --json flag to see raw response.${reset}\n"
+  echo "$response" | jq
+}
+
+if [ -z "$argc_command" ]; then
+  show_help
+  exit 0
+fi
+
+case "$argc_command" in
+search)
+  if [ -z "$argc_query" ]; then
+    echo "${red}Error:${reset} Search query is required." >&2
+    exit 1
+  fi
+
+  encoded_query=$(url_encode "$argc_query")
+  params="q=${encoded_query}&page=${argc_page}"
+
+  [ -n "$argc_amount" ] && params="${params}&amount=${argc_amount}" || params="${params}&amount=undefined"
+  params="${params}&collection=${argc_collection}"
+  [ -n "$argc_collection_name" ] && encoded_coll_name=$(url_encode "$argc_collection_name") && params="${params}&collection_name=${encoded_coll_name}"
+  [ -n "$argc_state" ] && params="${params}&state=${argc_state}"
+  [ -n "$argc_dataset" ] && params="${params}&dataset=${argc_dataset}"
+
+  response=$(make_request "searchrequest.json" "$params")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_search_results "$response"
+  ;;
+
+entity)
+  if [ -z "$argc_entity_id" ]; then
+    echo "${red}Error:${reset} Entity ID is required for entity lookup." >&2
+    exit 1
+  fi
+
+  # This endpoint may not exist or may have different parameters
+  # This is a placeholder implementation
+  params="entity_id=${argc_entity_id}"
+  response=$(make_request "entity.json" "$params")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_entity_details "$response"
+  ;;
+
+datasets)
+  # This is a placeholder command - the actual datasets endpoint would need to be discovered
+  echo "${yellow}Note:${reset} Datasets listing not yet implemented."
+  echo "Available dataset types based on search results:"
+  echo "  ${cyan}•${reset} Illinois campaign contributions"
+  echo "  ${cyan}•${reset} FAA Aircraft"
+  echo "  ${cyan}•${reset} Texas campaign contributions"
+  echo "  ${cyan}•${reset} Directors and employees, nonprofit"
+  echo "  ${cyan}•${reset} Ohio campaign contributions"
+  echo "  ${cyan}•${reset} Federal campaign contributions"
+  echo "  ${cyan}•${reset} Federal employee status"
+  echo "  ${cyan}•${reset} Oregon active businesses"
+  ;;
+
+*)
+  echo "${red}Error:${reset} Unknown command: ${argc_command}" >&2
+  show_help
+  exit 1
+  ;;
+esac
